@@ -6,11 +6,6 @@ the *target* of a framework/library call. Two classes that share a rare string
 `android/*`, `androidx/*`, `java/*`, `kotlin/*` APIs are almost certainly the
 same class even after renaming. We turn those invariants into high-confidence
 "anchor" pairs that the matcher locks in *before* structural scoring runs.
-
-Implemented here: B1 (framework-call anchors), B2 (string-IDF anchors), B7
-(seed generator). Deferred per the dev plan: B3 numeric/crypto constants, B4 JNI
-signatures, B5 resource IDs, B6 reflection strings — the loader already captures
-the call/string hooks they would build on.
 """
 
 from __future__ import annotations
@@ -32,23 +27,14 @@ FRAMEWORK_PREFIXES = (
 
 # Strings shorter than this, or purely numeric, carry too little signal.
 MIN_STRING_LEN = 4
-# Weight of the framework-call agreement relative to string evidence. Kept
-# small: framework calls disambiguate string-derived candidates, they don't
-# mint anchors on their own.
 FRAMEWORK_WEIGHT = 0.25
-# Weight of a shared framework supertype/interface as anchor evidence, relative
-# to a string. Full weight: a framework supertype survives R8 verbatim (cf.
-# LibPecker/apkdiff) and reaches string-less classes the string anchor can't.
-# Commonness is already handled by IDF — a supertype shared by many classes has
-# low idf and cannot anchor — so a *discount* here only suppresses the useful
-# case (a framework type shared by exactly one class on each side, the strongest
-# hierarchy signal). Measured across the OSS corpus at 1.0: net +recall, no
-# precision loss; a 0.5 discount was fully inert (couldn't clear the threshold).
 HIERARCHY_WEIGHT = 1.0
-# The near-universal default superclass — no signal, excluded from hierarchy tokens.
 _OBJECT_DESC = "Ljava/lang/Object;"
-# Minimum combined confidence to accept a pair as an anchor.
 DEFAULT_MIN_CONFIDENCE = 0.5
+
+# ★ 核心防爆阈值：如果一个 token 在单侧出现的类超过 20 个，按 IDF 权重极小且必然不是唯一锚点，
+# 提前过滤跳过，杜绝 80,000 x 80,000 产生千万级笛卡尔积元组撑爆 35GB 内存。
+MAX_ANCHOR_TOKEN_DF = 20
 
 
 def useful_strings(c: Class) -> set[str]:
@@ -56,8 +42,6 @@ def useful_strings(c: Class) -> set[str]:
 
 
 def hierarchy_tokens(c: Class) -> set[str]:
-    """Rename-invariant framework supertype/interface tokens (Object excluded).
-    App supertypes are renamed per build and so carry no cross-build signal."""
     toks: set[str] = set()
     sc = c.superclass
     if sc and sc != _OBJECT_DESC and sc.startswith(FRAMEWORK_PREFIXES):
@@ -69,7 +53,6 @@ def hierarchy_tokens(c: Class) -> set[str]:
 
 
 def framework_calls(c: Class) -> Counter:
-    """Multiset of framework/library call targets made by a class."""
     counts: Counter = Counter()
     for m in c.methods:
         for ref in m.calls:
@@ -92,20 +75,9 @@ def seed_anchors(
     *,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
 ) -> list[tuple[int, int, float]]:
-    """Return high-confidence (lhs_idx, rhs_idx, confidence) anchor pairs.
-
-    String evidence dominates and is IDF-weighted: a string shared by exactly
-    one class on each side contributes confidence 1.0 to that pair; common
-    strings are down-weighted by their document frequency and split across the
-    candidates they touch. Framework-call agreement adds a small bonus. Pairs
-    are then resolved 1-to-1 greedily by confidence.
-    """
     if not lhs or not rhs:
         return []
 
-    # Token space = useful strings (weight 1.0) ∪ framework hierarchy tokens
-    # (weight HIERARCHY_WEIGHT). Hierarchy tokens are namespaced with a leading
-    # NUL so they can never collide with a real app string.
     def tokens(c: Class) -> dict[str, float]:
         toks: dict[str, float] = {s: 1.0 for s in useful_strings(c)}
         for h in hierarchy_tokens(c):
@@ -130,8 +102,6 @@ def seed_anchors(
         for s in ts:
             rhs_by_tok[s].append(j)
 
-    # idf of a token seen exactly once == log(n+1); use it to normalize so a
-    # single unique shared string yields evidence 1.0.
     norm = math.log(n + 1) or 1.0
 
     evidence: dict[tuple[int, int], float] = defaultdict(float)
@@ -140,17 +110,26 @@ def seed_anchors(
             ris = rhs_by_tok.get(s)
             if not ris:
                 continue
+
+            # ★ 核心剪枝：两侧出现频率过高的通用 Token（如公共接口、常规提示语）不作为锚点，
+            # 避免巨量 (li, ri) 笛卡尔积耗尽 RAM
+            if len(ris) > MAX_ANCHOR_TOKEN_DF or lhs_df[s] > MAX_ANCHOR_TOKEN_DF:
+                continue
+
             tok_idf = math.log((n + 1) / df[s])
-            split = lhs_df[s] * len(ris)  # ambiguity penalty
+            split = lhs_df[s] * len(ris)
             w = weight * (tok_idf / norm) / split
+
+            # 权重过低（即便累计也无法达到 0.5 门槛）的微弱项不写入，节省内存
+            if w < 0.01:
+                continue
+
             for ri in ris:
                 evidence[(li, ri)] += w
 
     if not evidence:
         return []
 
-    # Framework-call agreement nudges string-derived candidates. Cache the
-    # per-class call multisets so each is computed at most once.
     fw_lhs: dict[int, Counter] = {}
     fw_rhs: dict[int, Counter] = {}
     for (li, ri) in list(evidence):
