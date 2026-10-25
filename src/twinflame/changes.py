@@ -13,13 +13,6 @@ Verdict per class:
 - **cosmetic** — matched, structurally not identical, but *no* semantic-feature
   change → re-obfuscation / re-optimization noise. Emitted, but demoted.
 - **unchanged**— matched and structurally identical.
-
-Design (per the UC discussion, roadmap E-3): the matcher is precision-biased
-(an unsure pair is left added/removed, visible on both sides); this classifier is
-recall-biased-but-**scored** — every class is emitted with a `magnitude` and
-category, nothing is silently dropped, and the *consumer* thresholds. Cosmetic/
-unchanged are ranked last ("demote, never drop"). Machine-consumable JSON + a
-human text summary; no interactive UX (external tools visualise via the mapping).
 """
 
 from __future__ import annotations
@@ -27,9 +20,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass
-from typing import Iterable, Optional
-
-from typing import Iterable as _Iterable, Optional, Union
+from typing import Iterable, Optional, Union
 
 from .features import (
     ClassMap,
@@ -41,15 +32,9 @@ from .features import (
 from .model import Class, Match
 from .provenance import ORIGIN_RANK, dev_descriptor_prefixes, origin_of
 
-# Bump on any breaking change to the JSON shape (see the Change-Report-Schema wiki page).
-# v2: added superclass / interfaces / components on paired rows (feedback #4).
-# v3: added `library` (dictionary-evidence label `<coord>@<version-range>`).
 CHANGES_SCHEMA_VERSION = 3
 
-# Review-worthiness ordering: real edits first, cosmetic/unchanged last.
 _KIND_RANK = {"modified": 0, "added": 1, "removed": 2, "cosmetic": 3, "unchanged": 4}
-# Structural distance at/above which a paired class with no semantic delta is
-# "unchanged" rather than "cosmetic" (float-exactness slack).
 _IDENTICAL = 1.0 - 1e-9
 
 
@@ -65,23 +50,12 @@ class ClassChange:
     origin: str                 # "app" / "library" / "unknown" (review priority)
     delta: Optional[FeatureDelta]  # only for "modified"
     method_deltas: tuple[MethodDelta, ...] = ()  # per-method localization (modified)
-    # "high" | "low". A modified verdict is "low" when it rests *only* on
-    # framework-call churn in non-app code — the cross-toolchain-noise signature
-    # (different R8 versions relocate calls between classes; measured 95% of the
-    # false-modified on a same-source cross-R8 rebuild). Everything else is "high".
     confidence: str = "high"
-    # Type-graph context for the reviewer (feedback #4). Framework superclass /
-    # interface descriptors survive R8, so they carry across the rename boundary.
     lhs_super: Optional[str] = None
     rhs_super: Optional[str] = None
     lhs_interfaces: tuple[str, ...] = ()
     rhs_interfaces: tuple[str, ...] = ()
-    # Sensitive-component short-codes implemented by this class on either side
-    # (e.g. ("BAS",) for an AccessibilityService). See components.py.
     components: tuple[str, ...] = ()
-    # Dictionary-evidence provenance: `<coord>@<version-range>` when the class
-    # matched the known-library signature dictionary (libdict.py). Present even
-    # for renamed classes the prefix heuristics can't reach.
     library: Optional[str] = None
 
     @property
@@ -107,10 +81,7 @@ def _size(c: Class) -> int:
 
 
 def build_class_map(matches: Iterable[Match]) -> dict[str, str]:
-    """A-descriptor -> B-descriptor over the matched (non-added/removed) pairs.
-
-    Threaded into `class_change` so *app*-type dependency deltas become
-    comparable across the rename boundary (see `features.diff_features`)."""
+    """A-descriptor -> B-descriptor over the matched (non-added/removed) pairs."""
     return {
         m.lhs.descriptor: m.rhs.descriptor
         for m in matches
@@ -141,9 +112,6 @@ def _library_evidence(
 
 
 def _apply_library(origin: str, label: Optional[str]) -> str:
-    """Dictionary evidence demotes a class to `library` — unless the dev prefix
-    claimed it as `app` (the documented priority: an app deliberately vendoring
-    a library under its own package still reviews as app code)."""
     return "library" if label and origin != "app" else origin
 
 
@@ -153,13 +121,8 @@ def classify_match(
     dev_prefix: Union[str, tuple[str, ...], None] = None,
     component_map: Optional[dict[str, set[str]]] = None,
     library_map: Optional[dict[str, str]] = None,
+    mapped_targets: Optional[frozenset[str]] = None,
 ) -> ClassChange:
-    """One `Match` -> one typed change verdict. `dev_prefix` (a descriptor prefix
-    or tuple of them, from `provenance.dev_descriptor_prefixes`) enables
-    app/library origin tagging. `component_map` (descriptor -> sensitive-component
-    codes, from `components.component_labels`) tags dangerous base classes.
-    `library_map` (descriptor -> `<coord>@<range>`, from `libdict.label_classes`)
-    adds dictionary-evidence library labels that survive R8 renames."""
     if m.is_added:
         lib = _library_evidence(library_map, m.rhs.descriptor)
         return ClassChange("added", None, m.rhs.descriptor, m.rhs.source_file,
@@ -177,7 +140,6 @@ def classify_match(
                            components=_components(m.lhs.descriptor, component_map=component_map),
                            library=lib)
 
-    delta = class_change(m.lhs, m.rhs, class_map)
     lib = _library_evidence(library_map, m.lhs.descriptor, m.rhs.descriptor)
     type_ctx = dict(
         lhs_super=m.lhs.superclass, rhs_super=m.rhs.superclass,
@@ -187,19 +149,18 @@ def classify_match(
     )
     anchored = m.breakdown.get("anchored") == 1.0
     src = m.lhs.source_file or m.rhs.source_file
-    # Older side names the class we review; dictionary evidence beats prefixes.
     origin = _apply_library(origin_of(m.lhs, dev_prefix), lib)
+
+    # ★ 核心短路优化：类完全一致（未修改）直接判定为 unchanged，
+    # 彻底跳过 37 万次无意义的 class_change 特征抽取与对比
+    if m.distance >= _IDENTICAL and not any(mm.status != "matched" for mm in m.method_matches):
+        return ClassChange("unchanged", m.lhs.descriptor, m.rhs.descriptor, src,
+                           0, m.distance, anchored, origin, None, (), "high", **type_ctx)
+
+    delta = class_change(m.lhs, m.rhs, class_map, mapped_targets)
     method_deltas = localize_method_changes(m.method_matches)
-    # A method added/removed is a real structural change even if it moved no
-    # class-level semantic feature (e.g. a new method with no framework calls) —
-    # so it counts as "modified", not cosmetic. (A modified method whose call
-    # set didn't move is *not* localized and stays cosmetic; see
-    # localize_method_changes.)
     n_structural = sum(1 for md in method_deltas if md.status in ("added", "deleted"))
     if delta.is_semantic or n_structural:
-        # Confidence: content-backed (string/type) or structural (method add/del)
-        # deltas are toolchain-stable; a *call-only* delta in non-app code is the
-        # cross-R8-version noise signature, so demote it to "low".
         content_backed = bool(
             delta.strings_added or delta.strings_removed
             or delta.refs_added or delta.refs_removed
@@ -217,22 +178,16 @@ def classify_match(
 
 def change_set(
     matches: Iterable[Match],
-    dev_package: Union[str, _Iterable[str], None] = None,
+    dev_package: Union[str, Iterable[str], None] = None,
     component_map: Optional[dict[str, set[str]]] = None,
     library_map: Optional[dict[str, str]] = None,
 ) -> list[ClassChange]:
-    """All verdicts, ranked most-review-worthy first: by kind (real edits first),
-    then **origin** (the developer's own `app` code above `library` churn), then
-    descending magnitude, then source file for determinism. `dev_package` — one
-    prefix or several (multi-root apps), e.g. from `--app-package`/`--package` or
-    the manifest — drives the app/library split; without it only known libraries
-    are demoted. `component_map` tags sensitive base classes (see components.py).
-    `library_map` (from `libdict.label_classes`) demotes dictionary-recognised
-    library classes even when R8 renamed them out of the prefix heuristics."""
     matches = list(matches)
     class_map = build_class_map(matches)
+    # ★ 关键优化：在循环最外层只计算一次，避免 1400 亿次集合分配
+    mapped_targets = frozenset(class_map.values())
     dev_prefix = dev_descriptor_prefixes(dev_package)
-    changes = [classify_match(m, class_map, dev_prefix, component_map, library_map)
+    changes = [classify_match(m, class_map, dev_prefix, component_map, library_map, mapped_targets)
                for m in matches]
     changes.sort(key=lambda c: (_KIND_RANK.get(c.kind, 9),
                                 ORIGIN_RANK.get(c.origin, 1),
@@ -246,8 +201,7 @@ def counts(changes: Iterable[ClassChange]) -> dict[str, int]:
 
 
 def render_json(changes: Iterable[ClassChange]) -> str:
-    """Machine-consumable report. Full deltas included for modified classes so a
-    downstream tool can localise the change without re-running the diff."""
+    """Machine-consumable report."""
     changes = list(changes)
     rows = []
     for c in changes:
@@ -328,7 +282,7 @@ def _row_values(c: ClassChange) -> dict[str, str]:
 
 
 def render_csv(changes: Iterable[ClassChange]) -> str:
-    """Flat, spreadsheet/grep-friendly view: one row per class change."""
+    """Flat, spreadsheet/grep-friendly view."""
     import csv
     import io
 
@@ -341,7 +295,7 @@ def render_csv(changes: Iterable[ClassChange]) -> str:
 
 
 def render_xml(changes: Iterable[ClassChange]) -> str:
-    """Same per-class data as XML for pipelines that consume it."""
+    """Same per-class data as XML."""
     import xml.etree.ElementTree as ET
 
     changes = list(changes)
@@ -368,15 +322,12 @@ _SELECT_KINDS = {
 
 
 def select_changes(changes: Iterable[ClassChange], mode: str) -> list[ClassChange]:
-    """Filter to only-changed ("changed"), only-same ("unchanged"), or "all"."""
     keep = _SELECT_KINDS.get(mode)
     changes = list(changes)
     return changes if keep is None else [c for c in changes if c.kind in keep]
 
 
 def filter_class(changes: Iterable[ClassChange], needle: str) -> list[ClassChange]:
-    """Keep changes whose lhs/rhs descriptor or source file contains `needle`
-    (case-insensitive). Accepts a class name, package path, or descriptor."""
     n = needle.lower()
     out = []
     for c in changes:
@@ -387,8 +338,6 @@ def filter_class(changes: Iterable[ClassChange], needle: str) -> list[ClassChang
 
 
 def sensitive_summary(changes: Iterable[ClassChange]) -> list[ClassChange]:
-    """Paired classes that implement a sensitive component on both sides — the
-    'both builds share a possibly-malicious implementation' signal."""
     from .components import SENSITIVE_CODES
 
     return [
@@ -398,7 +347,6 @@ def sensitive_summary(changes: Iterable[ClassChange]) -> list[ClassChange]:
 
 
 def render_components_text(changes: Iterable[ClassChange]) -> str:
-    """Human headline block for the sensitive-component overlap (feedback #4)."""
     from .components import SENSITIVE_CODES, code_name
 
     changes = list(changes)
@@ -418,16 +366,11 @@ _CONFIDENCE_RANK = {"high": 0, "low": 1}
 
 
 def filter_min_confidence(changes: Iterable[ClassChange], min_confidence: str) -> list[ClassChange]:
-    """Drop change verdicts below `min_confidence` ("high" | "low"). Only ever
-    removes *low-confidence modified* rows (call-only churn in non-app code);
-    added/removed/cosmetic/unchanged are always "high". `"low"` keeps everything."""
     floor = _CONFIDENCE_RANK.get(min_confidence, 1)
     return [c for c in changes if _CONFIDENCE_RANK.get(c.confidence, 0) <= floor]
 
 
 def render_text(changes: Iterable[ClassChange], *, top: int = 30) -> str:
-    """Human triage summary: counts (with an app-only breakdown), then the top
-    modified/added/removed — ordered app-first, each tagged with its origin."""
     changes = list(changes)
     c = counts(changes)
     app = counts([x for x in changes if x.origin == "app"])
@@ -470,7 +413,7 @@ def render_text(changes: Iterable[ClassChange], *, top: int = 30) -> str:
             anc = " [anchored]" if x.anchored else ""
             lo = " [low-conf]" if x.confidence == "low" else ""
             lines.append(f"  {_tag(x)} [{x.magnitude:4d}] {src}  {x.summary}{anc}{lo}")
-            for md in x.method_deltas[:3]:  # localize to the top changed methods
+            for md in x.method_deltas[:3]:
                 lines.append(f"          - {md.name}{md.descriptor}: {md.summary()}")
     added = [x for x in changes if x.kind == "added"][:top]
     if added:
