@@ -100,8 +100,6 @@ def _all_type_refs(c: Class) -> set[str]:
         refs.update(_object_types(f.type_desc))
     for m in c.methods:
         refs.update(_object_types(m.descriptor))
-    # A class never counts as depending on itself (self-references are not a
-    # cross-class signal and would translate to identity noise).
     refs.discard(c.descriptor)
     return refs
 
@@ -157,9 +155,6 @@ class FeatureDelta:
     strings_removed: tuple[str, ...]
     refs_added: tuple[str, ...]
     refs_removed: tuple[str, ...]
-    # App-type dependency deltas, in build-B naming (only populated when a
-    # ClassMap was supplied to diff_features). Kept separate from the framework
-    # `refs_*` so Phase 2 can weight app-logic changes vs. library churn.
     app_refs_added: tuple[str, ...] = ()
     app_refs_removed: tuple[str, ...] = ()
 
@@ -209,31 +204,32 @@ def _sorted_diff(a: frozenset[str], b: frozenset[str]) -> tuple[tuple[str, ...],
 
 
 def _app_ref_diff(
-    a: frozenset[str], b: frozenset[str], class_map: ClassMap
+    a: frozenset[str], b: frozenset[str], class_map: ClassMap,
+    mapped_targets: Optional[frozenset[str]] = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Diff app-type dependencies within the *matched universe*.
 
     LHS refs are translated A->B through `class_map`; RHS refs are restricted to
     owners that are themselves mapped targets. Refs whose owner the matcher did
-    not pair are excluded from both sides rather than reported as changes — an
-    unmatched owner is a matcher gap (or a genuinely added/removed class, which
-    Phase 2 reports at the class level), not evidence this class's dependency
-    set changed.
+    not pair are excluded from both sides rather than reported as changes.
     """
     lhs_translated = frozenset(class_map[t] for t in a if t in class_map)
-    mapped_targets = frozenset(class_map.values())
+    # ★ 关键性能修复：避免在 37 万次循环中每次重新遍历 class_map.values() 并哈希构建 frozenset
+    if mapped_targets is None:
+        mapped_targets = frozenset(class_map.values())
     rhs_comparable = frozenset(t for t in b if t in mapped_targets)
     return _sorted_diff(lhs_translated, rhs_comparable)
 
 
 def diff_features(
-    a: ClassFeatures, b: ClassFeatures, class_map: Optional[ClassMap] = None
+    a: ClassFeatures, b: ClassFeatures, class_map: Optional[ClassMap] = None,
+    mapped_targets: Optional[frozenset[str]] = None,
 ) -> FeatureDelta:
     calls_added, calls_removed = _sorted_diff(a.fw_calls, b.fw_calls)
     strings_added, strings_removed = _sorted_diff(a.strings, b.strings)
     refs_added, refs_removed = _sorted_diff(a.fw_refs, b.fw_refs)
     if class_map is not None:
-        app_refs_added, app_refs_removed = _app_ref_diff(a.app_refs, b.app_refs, class_map)
+        app_refs_added, app_refs_removed = _app_ref_diff(a.app_refs, b.app_refs, class_map, mapped_targets)
     else:
         app_refs_added, app_refs_removed = (), ()
     return FeatureDelta(
@@ -245,33 +241,23 @@ def diff_features(
 
 
 def class_change(
-    lhs: Class, rhs: Class, class_map: Optional[ClassMap] = None
+    lhs: Class, rhs: Class, class_map: Optional[ClassMap] = None,
+    mapped_targets: Optional[frozenset[str]] = None,
 ) -> FeatureDelta:
-    """Semantic delta between a matched class pair (lhs = build A, rhs = build B).
-
-    When `class_map` is given, app-type dependency changes are included (their
-    owner names translated A->B); without it only framework-stable features are
-    compared (backward-compatible)."""
-    return diff_features(class_features(lhs), class_features(rhs), class_map)
+    """Semantic delta between a matched class pair (lhs = build A, rhs = build B)."""
+    return diff_features(class_features(lhs), class_features(rhs), class_map, mapped_targets)
 
 
 # --- per-method localization ------------------------------------------------
 
 def method_framework_calls(m: Method) -> set[str]:
-    """Framework/library call targets this single method invokes — the
-    rename-invariant, method-local behavioural signal used to localise a class
-    change down to the method(s) that actually changed behaviour."""
+    """Framework/library call targets this single method invokes."""
     return {ref for ref in m.calls if _is_framework(ref)}
 
 
 @dataclass(frozen=True, slots=True)
 class MethodDelta:
-    """A localized method-level change inside a modified class.
-
-    `name`/`descriptor` are obfuscated (locate the method via the deobfuscation
-    map + decompiler); the actionable content is the status and the
-    framework-call delta / size.
-    """
+    """A localized method-level change inside a modified class."""
 
     status: str                 # "modified" | "added" | "deleted"
     name: str                   # obfuscated method name
@@ -297,19 +283,11 @@ class MethodDelta:
         return "method " + (", ".join(parts) if parts else "body changed")
 
 
-# Localization order: behavioural edits first (largest call-delta), then new
-# methods, then removed, each by size — most-review-worthy first within a class.
 _METHOD_STATUS_RANK = {"modified": 0, "added": 1, "deleted": 2}
 
 
 def localize_method_changes(method_matches) -> tuple[MethodDelta, ...]:
-    """Turn a match's per-method verdicts into localized `MethodDelta`s.
-
-    `modified` methods are surfaced **only when their framework-call set moved**
-    (a body-only re-optimization with no external-call change is indistinguishable
-    from cosmetic noise given the features we carry, so it is not localized).
-    `added`/`deleted` methods are always structural and always surfaced.
-    """
+    """Turn a match's per-method verdicts into localized `MethodDelta`s."""
     out: list[MethodDelta] = []
     for mm in method_matches:
         if mm.status == "added" and mm.rhs is not None:
@@ -325,7 +303,7 @@ def localize_method_changes(method_matches) -> tuple[MethodDelta, ...]:
                 frozenset(method_framework_calls(mm.lhs)),
                 frozenset(method_framework_calls(mm.rhs)),
             )
-            if added or removed:  # only localize a behavioural (call-set) change
+            if added or removed:
                 out.append(MethodDelta("modified", mm.rhs.name, mm.rhs.descriptor,
                                        mm.rhs.instr_count, added, removed))
     out.sort(key=lambda d: (_METHOD_STATUS_RANK.get(d.status, 9),
