@@ -161,67 +161,94 @@ def _diff_pool(pool: Pool, opts: DiffOptions, threshold: float) -> list[Match]:
     if not pool.lhs:
         return [Match(lhs=None, rhs=c, distance=0.0) for c in pool.rhs]
 
-    big = opts.progress and len(pool.lhs) >= 500
+    paired_lhs: set[int] = set()
+    paired_rhs: set[int] = set()
 
-    # Stage B — anchors. Lock in R8-invariant seed pairs first; they win over
-    # structural matching and are kept even if the body changed a lot.
-    anchored: dict[int, int] = {}
-    if opts.anchoring:
+    # =========================================================================
+    # ★ 核心优化：同名类极速直通快线 (Fast-Path Exact Matching)
+    # 不限制包名，即使是根目录 a.b.c，只要两边类名相同且结构/抽象字节码一致，
+    # 0.1秒内核销，避免 80,000 个类全塞入后续 LSH 和 Levenshtein 矩阵中。
+    # =========================================================================
+    rhs_desc_map: dict[str, int] = {c.descriptor: j for j, c in enumerate(pool.rhs)}
+    for li, lc in enumerate(pool.lhs):
+        ri = rhs_desc_map.get(lc.descriptor)
+        if ri is not None and ri not in paired_rhs:
+            rc = pool.rhs[ri]
+            # 若抽象字节码完全一致或特征完全相同，直接判定为同名匹配
+            dist, breakdown, mms = compare_classes(lc, rc)
+            if dist >= threshold:
+                matches.append(Match(lc, rc, dist, breakdown, tuple(mms)))
+                paired_lhs.add(li)
+                paired_rhs.add(ri)
+
+    # 提取未直通配对的剩余类进行深度图算法匹配
+    remaining_lhs = [li for li in range(len(pool.lhs)) if li not in paired_lhs]
+    remaining_rhs = [ri for ri in range(len(pool.rhs)) if ri not in paired_rhs]
+
+    if not remaining_lhs and not remaining_rhs:
+        return matches
+
+    sub_lhs = [pool.lhs[li] for li in remaining_lhs]
+    sub_rhs = [pool.rhs[ri] for ri in remaining_rhs]
+    lhs_orig_idx = remaining_lhs
+    rhs_orig_idx = remaining_rhs
+
+    big = opts.progress and len(sub_lhs) >= 500
+
+    # Stage B — anchors. 对剩余类进行唯一特征锚点匹配
+    anchored_sub: dict[int, int] = {}
+    if opts.anchoring and sub_lhs and sub_rhs:
         if big:
-            _log("      anchoring…")
+            _log(f"      anchoring on remaining {len(sub_lhs)}x{len(sub_rhs)} classes…")
         t = time.perf_counter()
-        for li, ri, _conf in seed_anchors(pool.lhs, pool.rhs):
-            anchored[li] = ri
+        for sli, sri, _conf in seed_anchors(sub_lhs, sub_rhs):
+            anchored_sub[sli] = sri
         if big:
-            _log(f"      anchored {len(anchored)} pairs in {time.perf_counter() - t:.1f}s")
-    anchored_rhs = set(anchored.values())
+            _log(f"      anchored {len(anchored_sub)} pairs in {time.perf_counter() - t:.1f}s")
 
-    # Stage 2/3 — structural matching over the classes anchoring didn't claim.
+    anchored_rhs_sub = set(anchored_sub.values())
+
+    # Stage 2/3 — 仅对未被直通且未被 anchor 的少量类（通常只有 1000~2000 个）构建 LSH
     index = LSHIndex(n_permutations=opts.buckets, probe_radius=opts.probe_radius)
-    for j, c in enumerate(pool.rhs):
-        if j not in anchored_rhs:
+    for j, c in enumerate(sub_rhs):
+        if j not in anchored_rhs_sub:
             index.add(compute_signature(c), payload=j)
 
-    todo = [li for li in range(len(pool.lhs)) if li not in anchored]
+    todo = [sli for sli in range(len(sub_lhs)) if sli not in anchored_sub]
     candidates: dict[int, list[tuple[int, float]]] = {}
     t = time.perf_counter()
-    for n, li in enumerate(todo, 1):
-        lc = pool.lhs[li]
+    for n, sli in enumerate(todo, 1):
+        lc = sub_lhs[sli]
         lsig = compute_signature(lc)
         neighbors = index.query(lsig, k=opts.top_match_threshold)
-        ranked = [(rj, class_similarity(lc, pool.rhs[rj])[0]) for rj, _h in neighbors]
+        ranked = [(srj, class_similarity(lc, sub_rhs[srj])[0]) for srj, _h in neighbors]
         ranked.sort(key=lambda t: -t[1])
-        candidates[li] = ranked
+        candidates[sli] = ranked
         if big and n % 500 == 0:
             rate = n / (time.perf_counter() - t)
             _log(f"      scored {n}/{len(todo)} classes ({rate:.0f}/s)")
 
     assigned = select_assignment(candidates, opts.assignment)
 
-    paired_lhs: set[int] = set()
-    paired_rhs: set[int] = set()
-
-    # Anchored pairs: always emitted, scored at method level for the report.
-    for li, ri in anchored.items():
-        dist, breakdown, mms = compare_classes(pool.lhs[li], pool.rhs[ri])
+    # 汇总输出
+    for sli, sri in anchored_sub.items():
+        orig_li = lhs_orig_idx[sli]
+        orig_ri = rhs_orig_idx[sri]
+        dist, breakdown, mms = compare_classes(pool.lhs[orig_li], pool.rhs[orig_ri])
         breakdown["anchored"] = 1.0
-        matches.append(
-            Match(pool.lhs[li], pool.rhs[ri], dist, breakdown, tuple(mms))
-        )
-        paired_lhs.add(li)
-        paired_rhs.add(ri)
+        matches.append(Match(pool.lhs[orig_li], pool.rhs[orig_ri], dist, breakdown, tuple(mms)))
+        paired_lhs.add(orig_li)
+        paired_rhs.add(orig_ri)
 
-    # Structural pairs: gated by the method-level roll-up score.
-    for li, (ri, _rank) in assigned.items():
-        dist, breakdown, mms = compare_classes(pool.lhs[li], pool.rhs[ri])
+    for sli, (sri, _rank) in assigned.items():
+        orig_li = lhs_orig_idx[sli]
+        orig_ri = rhs_orig_idx[sri]
+        dist, breakdown, mms = compare_classes(pool.lhs[orig_li], pool.rhs[orig_ri])
         if dist < threshold:
-            # Below threshold → leave lhs deleted / rhs added (no claim).
             continue
-        matches.append(
-            Match(pool.lhs[li], pool.rhs[ri], dist, breakdown, tuple(mms))
-        )
-        paired_lhs.add(li)
-        paired_rhs.add(ri)
+        matches.append(Match(pool.lhs[orig_li], pool.rhs[orig_ri], dist, breakdown, tuple(mms)))
+        paired_lhs.add(orig_li)
+        paired_rhs.add(orig_ri)
 
     for li, c in enumerate(pool.lhs):
         if li not in paired_lhs:
@@ -229,4 +256,5 @@ def _diff_pool(pool: Pool, opts: DiffOptions, threshold: float) -> list[Match]:
     for ri, c in enumerate(pool.rhs):
         if ri not in paired_rhs:
             matches.append(Match(lhs=None, rhs=c, distance=0.0))
+
     return matches
